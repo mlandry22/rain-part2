@@ -1,0 +1,371 @@
+# set it up
+setwd("D:/Kaggles/Rain")
+library(data.table)
+library(readr)
+set.seed(222)
+
+### TRAIN ###
+
+# pull in training data          
+tr_raw0 <- fread("D:/Kaggles/Rain/train.csv", select = c(
+  "Id", 
+  "Expected",
+  "minutes_past",                                                       # make sure these match
+  "radardist_km",                                                       
+  "Ref", 
+  "Ref_5x5_10th",
+  "Ref_5x5_50th",
+  "Ref_5x5_90th",
+  "RefComposite", 
+  "RefComposite_5x5_10th",
+  "RefComposite_5x5_50th",
+  "RefComposite_5x5_90th",
+  "RhoHV",
+  "RhoHV_5x5_50th",
+  "Zdr",
+  "Zdr_5x5_50th",
+  "Kdp")
+)
+
+# create features...
+# create time spans between measurements for each Id
+minutes <- tr_raw0$minutes_past
+n <- length(minutes)
+timepassed <- vector(mode="numeric", length = n) 
+timepassed[1] <- minutes[1]
+timepassed[-1] <- diff(minutes)
+for (i in seq(2, n)) {
+  if (minutes[i] < minutes[i-1]) {
+    timepassed[i] <- minutes[i]  
+  }
+}
+tr_raw0$timespans <- timepassed/60
+
+#estimate rainfall rates as a function of reflectivity
+marshall_palmer <- function(dbz) ((10**(dbz/10))/200) ** (1/1.6)        # standard marshall-palmer function to find rainfall rate;
+wsr_88d         <- function(dbz) ((10**(dbz/10))/300) ** (1/1.4)        # modified z-R function according to newer NWS standard;
+nws_tropical    <- function(dbz) ((10**(dbz/10))/250) ** (1/1.2)        # profile for heavy rains and tropical storms
+tr_raw0$rate <- marshall_palmer(tr_raw0$Ref)                
+# subset1 <- tr_raw0$Ref>40 & !is.na(tr_raw0$Ref)                       
+# tr_raw0$rate[subset1] <- nws_tropical(tr_raw0$Ref[subset1])           
+tr_raw0$rateC <- wsr_88d(tr_raw0$RefComposite)
+
+# create a validation set                              
+idnums <- unique(tr_raw0$Id)
+index <-sample(1:length(idnums), length(idnums)/5)                     
+val_raw1 <- tr_raw0[Id %in% index, ]                                 
+tr_raw1 <- tr_raw0[!Id %in% index, ]  
+val_raw2 <- val_raw1[, .(Id, minutes_past, Ref)]                        # saving this for use with sample_solution.R
+write_csv(val_raw2, "D:/Kaggles/Rain/val_raw2.csv")
+
+# deal with outliers
+tr_raw2 <- subset(tr_raw1, Expected <= 60)                              # cut high values - reduces MAE on valset;
+legit_reads <- 0.254 * 1:500                                            # set valid values based on measurable increments of 0.01 in
+tr_raw2 <- tr_raw2[round(Expected, 4) %in% legit_reads]                 
+
+rm(tr_raw1)
+rm(tr_raw0)
+rm(val_raw2)
+
+#Collapsify to one record per Id and generate more features
+tr <- tr_raw2[, .(
+    target = log1p(mean(Expected, na.rm = T)),                          
+    wref = mean(timespans * Ref, na.rm = T),                                        
+    refsq =  mean(Ref^2, na.rm = T),
+    ref1 = mean(Ref_5x5_10th, na.rm = T),
+    ref1sq = mean(Ref_5x5_10th^2, na.rm = T),
+    ref5 = mean(Ref_5x5_50th, na.rm = T),
+    ref5sq = mean(Ref_5x5_50th^2, na.rm = T),
+    ref9 = mean(Ref_5x5_90th, na.rm = T),
+    ref9sq = mean(Ref_5x5_90th^2, na.rm = T),
+    wrefc = mean(timespans * RefComposite, na.rm = T),
+    refcsq = mean(RefComposite^2, na.rm = T),
+    refc1 = mean(RefComposite_5x5_10th, na.rm = T),
+    refc1sq = mean(RefComposite_5x5_10th^2, na.rm = T),
+    refc5 = mean(RefComposite_5x5_50th, na.rm = T),
+    refc5sq = mean(RefComposite_5x5_50th^2, na.rm = T),
+    refc9 = mean(RefComposite_5x5_90th, na.rm = T),
+    refc9sq = mean(RefComposite_5x5_90th^2, na.rm = T),
+    # wrhohv = mean(timespans * RhoHV, na.rm = T),
+    rhohvsq = mean(RhoHV^2, na.rm = T),
+    rhohv5 = mean(RhoHV_5x5_50th, na.rm = T),
+    rhohv5sq = mean(RhoHV_5x5_50th^2, na.rm = T),
+    wzdr = mean(timespans * Zdr, na.rm = T),
+    # zdrsq = mean(Zdr^2, na.rm = T),
+    zdr5 = mean(Zdr_5x5_50th, na.rm = T),
+    zdr5sq = mean(Zdr_5x5_50th^2, na.rm = T),
+    # wkdp = mean(timespans * Kdp, na.rm = T),
+    # kdp5 = mean(Kdp_5x5_50th, na.rm = T),
+    kdpsq = mean(Kdp^2, na.rm = T),
+    # timemax = max(time, na.rm = T),
+    ratemax = max(rate, na.rm = T),                                     # max values cause warnings but will be purged with !is.na below
+    refsd = sd(Ref, na.rm = T),
+    ratesd = sd(rate, na.rm = T), 
+    # zdrsd = sd(Zdr, na.rm = T), 
+    precip = sum(timespans * rate, na.rm = T),   
+    precipC = sum(timespans * rateC, na.rm = T),
+    refratio = mean(Ref_5x5_50th/Ref, na.rm = T),
+    refratio2 = mean((Ref_5x5_90th-Ref_5x5_10th)/Ref, na.rm = T), 
+    refcratio = mean(RefComposite_5x5_50th/RefComposite, na.rm = T),    
+    refcratio2 = mean((RefComposite_5x5_90th-RefComposite_5x5_10th)/RefComposite, na.rm = T),
+    # rhoratio = mean(RhoHV_5x5_50th/RhoHV, na.rm = T),
+    # Zdrratio = mean(Zdr_5x5_50th/Zdr, na.rm = T),
+    # kdpratio = mean(Kdp_5x5_50th/Kdp, na.rm = T),
+    rd = mean(radardist_km, na.rm = T),    
+    rdsq = mean(radardist_km^2, na.rm = T),
+    # records = .N,
+    refmissing = sum(is.na(Ref))
+    ), Id]
+
+train <- tr[!is.na(tr$wref), ]                                           # these types will not be scored in the test set, so dropping 
+train <- as.data.frame(train)                                            # them here also
+
+rm(tr_raw2)
+
+
+
+
+### MODEL ###
+
+# prep for xgboost
+library(xgboost)
+library(Metrics)
+y <- train$target
+train <- train[, -c(1:2)]
+xgtrain <- xgb.DMatrix(as.matrix(train), label=y, missing=NA)
+
+# create custom MAE eval function and run it
+meanabserr <- function(preds, xgtrain) {
+  labels <- getinfo(xgtrain, "label")
+  err <- mae(expm1(as.numeric(labels)), expm1(as.numeric(preds)))       
+  return(list(metric = "MAE", value = err))
+}  
+param0 <- list(objective  = "reg:linear" 
+  , eta = 0.035         
+  , subsample = 0.9                                                      # model is not tuned
+  , min_child_weight = 5
+  , max_depth = 8
+)
+# xgbfirst <- xgb.cv(data=xgtrain
+#  , params=param0
+#  , feval = meanabserr                                                  # custom eval function
+#  , nrounds=1250                                                          
+#  , nfold=5
+#  , verbose=1
+#  , early.stop.round=NULL
+# ) 
+# plot(xgbfirst[, test.MAE.mean])
+# bestround <- which.min(xgbfirst[,test.MAE.mean])
+bestround = 1250
+watched <- list(eval=xgtrain)
+xgbmod  <- xgb.train(data=xgtrain 
+  , params=param0
+  , feval = meanabserr
+  , nrounds = bestround
+  , verbose = 1
+  , watchlist = watched
+)
+xgbfactors <- xgb.importance(dimnames(train)[[2]], model=xgbmod)         
+xgb.plot.importance(xgbfactors)
+
+
+
+### VALIDATE ###
+
+library(Metrics)
+
+source("D:/Kaggles/Rain/sample_solution.R")
+
+#collapisfy the validation set
+val <- val_raw1[, .(
+  target = log1p(mean(Expected, na.rm = T)),                            
+  wref = mean(timespans * Ref, na.rm = T),                                        
+  refsq =  mean(Ref^2, na.rm = T),
+  ref1 = mean(Ref_5x5_10th, na.rm = T),
+  ref1sq = mean(Ref_5x5_10th^2, na.rm = T),
+  ref5 = mean(Ref_5x5_50th, na.rm = T),
+  ref5sq = mean(Ref_5x5_50th^2, na.rm = T),
+  ref9 = mean(Ref_5x5_90th, na.rm = T),
+  ref9sq = mean(Ref_5x5_90th^2, na.rm = T),
+  wrefc = mean(timespans * RefComposite, na.rm = T),
+  refcsq = mean(RefComposite^2, na.rm = T),
+  refc1 = mean(RefComposite_5x5_10th, na.rm = T),
+  refc1sq = mean(RefComposite_5x5_10th^2, na.rm = T),
+  refc5 = mean(RefComposite_5x5_50th, na.rm = T),
+  refc5sq = mean(RefComposite_5x5_50th^2, na.rm = T),
+  refc9 = mean(RefComposite_5x5_90th, na.rm = T),
+  refc9sq = mean(RefComposite_5x5_90th^2, na.rm = T),
+  # wrhohv = mean(timespans * RhoHV, na.rm = T),
+  rhohvsq = mean(RhoHV^2, na.rm = T),
+  rhohv5 = mean(RhoHV_5x5_50th, na.rm = T),
+  rhohv5sq = mean(RhoHV_5x5_50th^2, na.rm = T),
+  wzdr = mean(timespans * Zdr, na.rm = T),
+  # zdrsq = mean(Zdr^2, na.rm = T),
+  zdr5 = mean(Zdr_5x5_50th, na.rm = T),
+  zdr5sq = mean(Zdr_5x5_50th^2, na.rm = T),
+  # wkdp = mean(timespans * Kdp, na.rm = T),
+  # kdp5 = mean(Kdp_5x5_50th, na.rm = T),
+  kdpsq = mean(Kdp^2, na.rm = T),
+  # timemax = max(time, na.rm = T),
+  ratemax = max(rate, na.rm = T),                                     # max values cause warnings but will be purged with !is.na below
+  refsd = sd(Ref, na.rm = T),
+  ratesd = sd(rate, na.rm = T), 
+  # zdrsd = sd(Zdr, na.rm = T), 
+  precip = sum(timespans * rate, na.rm = T),     
+  precipC = sum(timespans * rateC, na.rm = T),
+  refratio = mean(Ref_5x5_50th/Ref, na.rm = T),
+  refratio2 = mean((Ref_5x5_90th-Ref_5x5_10th)/Ref, na.rm = T), 
+  refcratio = mean(RefComposite_5x5_50th/RefComposite, na.rm = T),    
+  refcratio2 = mean((RefComposite_5x5_90th-RefComposite_5x5_10th)/RefComposite, na.rm = T),
+  # rhoratio = mean(RhoHV_5x5_50th/RhoHV, na.rm = T),
+  # Zdrratio = mean(Zdr_5x5_50th/Zdr, na.rm = T),
+  # kdpratio = mean(Kdp_5x5_50th/Kdp, na.rm = T),
+  rd = mean(radardist_km, na.rm = T),    
+  rdsq = mean(radardist_km^2, na.rm = T),
+  # records = .N,
+  refmissing = sum(is.na(Ref))
+), Id]
+val <- val[!is.na(val$wref), ]                                           # these types will not be scored in the test set, so dropping
+val <- as.data.frame(val)   
+
+# predict values
+valnames <- val$Id
+valtruths <- val$target
+val<-val[, -c(1:2)]
+xgval <- xgb.DMatrix(as.matrix(val), missing=NA)
+xgpred  <- predict(xgbmod, xgval)
+validation <- data.frame(Id=valnames, Predicted=expm1(xgpred), Truth=expm1(valtruths))  # big piece of MAE is coming from true values > 4000
+validation <- validation[order(validation$Predicted, validation$Truth), ]
+
+# fit the predictions to a distribution                                 
+library(fitdistrplus)                                                   
+gfit <- fitdist(validation$Predicted, "gamma")
+denscomp(gfit)                                                          
+coef <- coef(gfit)
+gammavals <- rgamma(nrow(validation), coef[1], rate = coef[2])          # potential here for probability matching;
+gammavals <- sort(gammavals)                                            # could also try linear shifting and similar
+validation$Gammavals <- gammavals
+
+# pull in the sample solution algorithm applied to the validation set
+validation <- validation[order(validation$Id), ]
+matchedrows <- match(validation$Id, results$Id)                         # this is to test blending with sample_solution.csv
+validation$Sample <- results[matchedrows, Expected]                    
+
+#evaluate
+mae(validation$Truth, validation$Predicted)
+mae(validation$Truth, validation$Gammavals)                             # currently using Exel solver with this as a 'poor man's stacker'
+mae(validation$Truth, validation$Sample)                                
+write_csv(validation, "val-10-29-4.csv")
+
+
+
+### TEST ###
+
+# process test data
+te_raw <- fread("D:/Kaggles/Rain/test.csv", select=c(
+  "Id", 
+  "Expected",
+  "minutes_past",                                                       # make sure these match
+  "radardist_km",                                                       
+  "Ref", 
+  "Ref_5x5_10th",
+  "Ref_5x5_50th",
+  "Ref_5x5_90th",
+  "RefComposite", 
+  "RefComposite_5x5_10th",
+  "RefComposite_5x5_50th",
+  "RefComposite_5x5_90th",
+  "RhoHV",
+  "RhoHV_5x5_50th",
+  "Zdr",
+  "Zdr_5x5_50th",
+  "Kdp")
+)
+
+
+minutes <- te_raw$minutes_past
+n <- length(minutes)
+timepassed <- vector(mode="numeric", length = n) 
+timepassed[1] <- minutes[1]
+timepassed[-1] <- diff(minutes)
+for (i in seq(2, n)) {
+  if (minutes[i] < minutes[i-1]) {
+    timepassed[i] <- minutes[i]  
+  }
+}
+te_raw$timespans <- timepassed/60
+
+te_raw$rate <- marshall_palmer(te_raw$Ref)                
+# subset1 <- tr_raw0$Ref>40 & !is.na(tr_raw0$Ref)                       
+# tr_raw0$rate[subset1] <- nws_tropical(tr_raw0$Ref[subset1])           
+te_raw$rateC <- wsr_88d(te_raw$RefComposite)
+
+    
+
+# collapse
+te <- te_raw[, .(
+  wref = mean(timespans * Ref, na.rm = T),                                        
+  refsq =  mean(Ref^2, na.rm = T),
+  ref1 = mean(Ref_5x5_10th, na.rm = T),
+  ref1sq = mean(Ref_5x5_10th^2, na.rm = T),
+  ref5 = mean(Ref_5x5_50th, na.rm = T),
+  ref5sq = mean(Ref_5x5_50th^2, na.rm = T),
+  ref9 = mean(Ref_5x5_90th, na.rm = T),
+  ref9sq = mean(Ref_5x5_90th^2, na.rm = T),
+  wrefc = mean(timespans * RefComposite, na.rm = T),
+  refcsq = mean(RefComposite^2, na.rm = T),
+  refc1 = mean(RefComposite_5x5_10th, na.rm = T),
+  refc1sq = mean(RefComposite_5x5_10th^2, na.rm = T),
+  refc5 = mean(RefComposite_5x5_50th, na.rm = T),
+  refc5sq = mean(RefComposite_5x5_50th^2, na.rm = T),
+  refc9 = mean(RefComposite_5x5_90th, na.rm = T),
+  refc9sq = mean(RefComposite_5x5_90th^2, na.rm = T),
+  # wrhohv = mean(timespans * RhoHV, na.rm = T),
+  rhohvsq = mean(RhoHV^2, na.rm = T),
+  rhohv5 = mean(RhoHV_5x5_50th, na.rm = T),
+  rhohv5sq = mean(RhoHV_5x5_50th^2, na.rm = T),
+  wzdr = mean(timespans * Zdr, na.rm = T),
+  # zdrsq = mean(Zdr^2, na.rm = T),
+  zdr5 = mean(Zdr_5x5_50th, na.rm = T),
+  zdr5sq = mean(Zdr_5x5_50th^2, na.rm = T),
+  # wkdp = mean(timespans * Kdp, na.rm = T),
+  # kdp5 = mean(Kdp_5x5_50th, na.rm = T),
+  kdpsq = mean(Kdp^2, na.rm = T),
+  # timemax = max(time, na.rm = T),
+  ratemax = max(rate, na.rm = T),                                     # max values cause warnings but will be purged with !is.na below
+  refsd = sd(Ref, na.rm = T),
+  ratesd = sd(rate, na.rm = T), 
+  # zdrsd = sd(Zdr, na.rm = T), 
+  precip = sum(timespans * rate, na.rm = T),     
+  precipC = sum(timespans * rateC, na.rm = T),
+  refratio = mean(Ref_5x5_50th/Ref, na.rm = T),
+  refratio2 = mean((Ref_5x5_90th-Ref_5x5_10th)/Ref, na.rm = T), 
+  refcratio = mean(RefComposite_5x5_50th/RefComposite, na.rm = T),    
+  refcratio2 = mean((RefComposite_5x5_90th-RefComposite_5x5_10th)/RefComposite, na.rm = T),
+  # rhoratio = mean(RhoHV_5x5_50th/RhoHV, na.rm = T),
+  # Zdrratio = mean(Zdr_5x5_50th/Zdr, na.rm = T),
+  # kdpratio = mean(Kdp_5x5_50th/Kdp, na.rm = T),
+  rd = mean(radardist_km, na.rm = T),    
+  rdsq = mean(radardist_km^2, na.rm = T),
+  # records = .N,
+  refmissing = sum(is.na(Ref))
+    ),Id] 
+
+rm(te_raw)
+
+te<-as.data.frame(te) 
+xgtest = xgb.DMatrix(as.matrix(te[, -1]), missing = NA)
+
+# predictions for each row of te
+pr  <- predict(xgbmod, xgtest)                                          # remember that anything with blank ref value is not scored
+xgb_prediction <- expm1(pr)                                             
+
+# pull in sample values as a way to ensemble
+sample_sol <-fread("D:/Kaggles/Rain/sample_solution.csv")
+
+# create the ensemble                      
+res <- data.frame(Id=te$Id, Expected = 0.95 * xgb_prediction + 0.05 * sample_sol$Expected)  
+# res$Predicted <- xgb_prediction                                       
+# res$Sample <- sample_sol$Expected
+
+write_csv(res, "xgb-10-29-4.csv")                                      
